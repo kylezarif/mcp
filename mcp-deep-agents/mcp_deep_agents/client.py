@@ -2,15 +2,16 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -27,23 +28,36 @@ load_dotenv(here.parent / "mcp-client" / ".env", override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+# Strip surrounding quotes that sometimes appear in .env
+if OPENAI_API_KEY and OPENAI_API_KEY.startswith('"') and OPENAI_API_KEY.endswith('"'):
+    OPENAI_API_KEY = OPENAI_API_KEY.strip('"')
+# Trim whitespace that can sneak in from .env
+if OPENAI_API_KEY:
+    OPENAI_API_KEY = OPENAI_API_KEY.strip()
 SYSTEM_PROMPT = os.getenv(
     "MCP_SYSTEM_PROMPT",
-    "You are an AI assistant integrated with MCP tool servers. Use tools when they help answer the user's queries.",
+    (
+        "You are a deep agent that can plan (write TODOs), call MCP tools, "
+        "store intermediate results to disk, and summarize outcomes. "
+        "Be explicit about steps and use tools when they help."
+    ),
 )
 MAX_HISTORY = int(os.getenv("MCP_MAX_HISTORY", "40"))
-TOOL_NAME_SEP = "__"  # safe for OpenAI tool name schema
+TOOL_NAME_SEP = "__"
+RUNS_DIR = here.parent / "runs"
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class AgentState(dict):
-    """Simple state container for LangGraph."""
-
     messages: List[Any]
     available_tools: List[Dict[str, Any]]
     tool_sessions: Dict[str, Any]
+    run_dir: Path
+    todos: List[str]
+    log_path: Path
 
 
-class MCPAgent:
+class DeepMCPAgent:
     def __init__(self):
         self.exit_stack = AsyncExitStack()
         self.tool_sessions: Dict[str, Dict[str, Any]] = {}
@@ -55,25 +69,17 @@ class MCPAgent:
         )
         self._graph = None
 
-    def _tool_result_to_text(self, result) -> str:
-        c = getattr(result, "content", result)
-        if c is None:
-            return ""
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            parts = []
-            for item in c:
-                if isinstance(item, dict):
-                    parts.append(item.get("text") or json.dumps(item, ensure_ascii=False))
-                else:
-                    txt = getattr(item, "text", None)
-                    parts.append(txt if isinstance(txt, str) else str(item))
-            return "\n".join(parts)
-        return str(c)
+    def _log_run(self, state: AgentState, message: str):
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] {message}\n"
+            state["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            with state["log_path"].open("a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            logger.debug("Failed to write run log line: %s", message)
 
     async def connect_servers(self):
-        """Load servers from ~/.mcp/config.json and initialize sessions."""
         config_path = Path.home() / ".mcp" / "config.json"
         if not config_path.exists():
             logger.warning("No ~/.mcp/config.json found — starting without servers.")
@@ -116,8 +122,44 @@ class MCPAgent:
                 )
         return tools
 
+    def _write_todos(self, user_request: str) -> List[str]:
+        prompt = (
+            "Create a concise TODO list (3-6 steps) to satisfy the user request. "
+            "Return JSON array of strings, no other text."
+        )
+        msg = [
+            SystemMessage(content=prompt),
+            HumanMessage(content=user_request),
+        ]
+        resp = self.llm.invoke(msg, response_format={"type": "json_object"})
+        try:
+            payload = json.loads(resp.content)
+            todos = payload.get("todos") or payload.get("items") or payload
+            if isinstance(todos, list):
+                return [str(t).strip() for t in todos if str(t).strip()]
+        except Exception:
+            pass
+        # Fallback: split lines
+        return [line.strip("-• ").strip() for line in resp.content.splitlines() if line.strip()]
+
+    def _tool_result_to_text(self, result) -> str:
+        c = getattr(result, "content", result)
+        if c is None:
+            return ""
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            parts = []
+            for item in c:
+                if isinstance(item, dict):
+                    parts.append(item.get("text") or json.dumps(item, ensure_ascii=False))
+                else:
+                    txt = getattr(item, "text", None)
+                    parts.append(txt if isinstance(txt, str) else str(item))
+            return "\n".join(parts)
+        return str(c)
+
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph agent graph."""
         workflow = StateGraph(AgentState)
 
         async def call_llm(state: AgentState, config: Optional[RunnableConfig] = None):
@@ -146,20 +188,32 @@ class MCPAgent:
                     tool_names.append(name)
                 logger.info("LLM requested tools: %s", tool_names)
             new_messages = state["messages"] + [response]
-            return {"messages": new_messages, "available_tools": available_tools, "tool_sessions": state["tool_sessions"]}
+            return {
+                "messages": new_messages,
+                "available_tools": available_tools,
+                "tool_sessions": state["tool_sessions"],
+                "run_dir": state["run_dir"],
+                "todos": state["todos"],
+                "log_path": state["log_path"],
+            }
 
         async def maybe_tool(state: AgentState, config: Optional[RunnableConfig] = None):
             last = state["messages"][-1]
             tool_calls = getattr(last, "tool_calls", None)
             if not tool_calls:
-                return {"messages": state["messages"], "available_tools": state["available_tools"], "tool_sessions": state["tool_sessions"]}
+                return {
+                    "messages": state["messages"],
+                    "available_tools": state["available_tools"],
+                    "tool_sessions": state["tool_sessions"],
+                    "run_dir": state["run_dir"],
+                    "todos": state["todos"],
+                    "log_path": state["log_path"],
+                }
             tool_msgs: List[Any] = []
             for call in tool_calls:
-                # Support both dict-like and object-like tool calls
                 fn = getattr(call, "function", None)
                 if fn is None and hasattr(call, "get"):
                     fn = call.get("function")
-                # Some SDKs surface name/arguments directly on the call
                 full_name = (
                     getattr(fn, "name", None)
                     or (fn.get("name") if isinstance(fn, dict) else None)
@@ -181,23 +235,14 @@ class MCPAgent:
                 if args_raw is None and isinstance(fn, dict):
                     args_raw = fn.get("arguments")
                 if args_raw is None:
-                    # Fallback to call.args / call.arguments if present
                     args_raw = getattr(call, "arguments", None) or getattr(call, "args", None)
                 args = json.loads(args_raw or "{}")
-                # Heuristic: if ECB series is missing args, try to parse last user message with flow/key pattern
-                if tool_name == "get_ecb_series" and not args:
-                    last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
-                    if last_user:
-                        txt = (last_user.content or "").strip()
-                        if "/" in txt:
-                            flow_ref, key_val = txt.split("/", 1)
-                            args = {"flow_ref": flow_ref.strip(), "key": key_val.strip().rstrip(".")}
-                            logger.info("Heuristically filled get_ecb_series args=%s from user text", args)
+
+                # Fill heuristics for common missing args
                 if tool_name in {"company_news", "search_news"} and not args:
                     last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
                     if last_user:
                         q = (last_user.content or "").strip().rstrip(".")
-                        # If the user said "search ... about X", focus on the segment after "about"
                         if " about " in q.lower():
                             try:
                                 q = q.split(" about ", 1)[1]
@@ -211,13 +256,29 @@ class MCPAgent:
                 if tool_name == "topic_trends" and not args:
                     last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
                     if last_user:
-                        topic = (last_user.content or "").strip().rstrip(".")
-                        if " for " in topic.lower():
-                            topic = topic.split(" for ", 1)[1].strip()
+                        topic_raw = (last_user.content or "").strip().rstrip(".")
+                        lower = topic_raw.lower()
+                        # If the user said "for X", grab X; otherwise default to the whole phrase.
+                        topic = topic_raw
+                        if " for " in lower:
+                            topic = topic_raw.split(" for ", 1)[1].strip()
+                            # Trim anything after "and" as a simple cleanup
+                            if " and " in topic.lower():
+                                topic = topic.split(" and ", 1)[0].strip()
+                        # If "inflation" is present anywhere, prefer that as the topic
+                        if "inflation" in lower:
+                            topic = "inflation"
                         args = {"topic": topic}
                         logger.info("Heuristically filled topic_trends args=%s from user text", args)
+                if tool_name == "get_ecb_series" and not args:
+                    last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+                    if last_user:
+                        txt = (last_user.content or "").strip()
+                        if "/" in txt:
+                            flow_ref, key_val = txt.split("/", 1)
+                            args = {"flow_ref": flow_ref.strip(), "key": key_val.strip().rstrip(".")}
+                            logger.info("Heuristically filled get_ecb_series args=%s from user text", args)
                 if tool_name == "get_daily_ohlcv" and not args:
-                    # Try to extract a ticker like AAPL.US from the last user message, plus optional dates
                     import re
 
                     last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
@@ -230,6 +291,12 @@ class MCPAgent:
                             if bare_match:
                                 bare = bare_match.group(1).lower() + ".us"
                         dates = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", txt)
+                        # Year-only hint -> set start/end for that year
+                        if not dates:
+                            years = re.findall(r"\b(20\\d{2})\b", txt)
+                            if years:
+                                y = years[0]
+                                dates = [f"{y}-01-01", f"{y}-12-31"]
                         start_date = dates[0] if len(dates) >= 1 else None
                         end_date = dates[1] if len(dates) >= 2 else None
                         if match:
@@ -243,15 +310,39 @@ class MCPAgent:
                         if match or bare:
                             logger.info("Heuristically filled get_daily_ohlcv args=%s from user text", args)
                 if tool_name in {"get_recent_filings", "get_company_submissions", "get_company_facts"} and not args:
+                    import re
+
                     last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
                     if last_user:
-                        import re
-
                         digits = re.findall(r"\b(\d{5,10})\b", last_user.content or "")
                         if digits:
                             cik = digits[0].zfill(10)
                             args = {"cik": cik}
                             logger.info("Heuristically filled SEC args=%s from user text", args)
+                if tool_name == "get_worldbank_indicator" and not args:
+                    last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+                    if last_user:
+                        txt = (last_user.content or "").strip()
+                        parts = txt.replace(",", " ").split()
+                        country = None
+                        indicator = None
+                        for token in parts:
+                            clean = token.strip().strip(".")
+                            if clean.upper() == clean and len(clean) == 3:
+                                country = clean
+                            if "." in clean:
+                                indicator = clean
+                        if not country:
+                            # default to USA if "US" appears in the text
+                            if "us" in txt.lower() or "usa" in txt.lower():
+                                country = "USA"
+                        if country and indicator:
+                            args = {"country": country, "indicator": indicator}
+                            logger.info("Heuristically filled World Bank args=%s from user text", args)
+                if tool_name == "get_hpi" and not args:
+                    args = {"geo_level": "state"}
+                    logger.info("Defaulted FHFA HPI args=%s", args)
+
                 server_entry = state["tool_sessions"].get(server_name)
                 if not server_entry:
                     tool_msgs.append(
@@ -263,6 +354,7 @@ class MCPAgent:
                     )
                     continue
                 try:
+                    self._log_run(state, f"CALL {full_name} args={args}")
                     logger.info("Calling tool %s args=%s", full_name, args)
                     result = await server_entry["session"].call_tool(tool_name, args)
                     logger.info(
@@ -281,6 +373,10 @@ class MCPAgent:
                         is_error = True
                     if is_error:
                         text = f"[TOOL ERROR] {text}"
+                    self._log_run(
+                        state,
+                        f"RESULT {full_name} isError={is_error} len={len(text)}",
+                    )
                     tool_msgs.append(
                         ToolMessage(
                             content=text,
@@ -288,6 +384,10 @@ class MCPAgent:
                             tool_call_id=call_id,
                         )
                     )
+                    # Persist tool output to the run directory
+                    ts = int(time.time())
+                    out_path = state["run_dir"] / f"{full_name.replace(TOOL_NAME_SEP, '_')}_{ts}.txt"
+                    out_path.write_text(text)
                 except Exception as exc:
                     tool_msgs.append(
                         ToolMessage(
@@ -297,10 +397,16 @@ class MCPAgent:
                         )
                     )
             new_messages = state["messages"] + tool_msgs
-            return {"messages": new_messages, "available_tools": state["available_tools"], "tool_sessions": state["tool_sessions"]}
+            return {
+                "messages": new_messages,
+                "available_tools": state["available_tools"],
+                "tool_sessions": state["tool_sessions"],
+                "run_dir": state["run_dir"],
+                "todos": state["todos"],
+                "log_path": state["log_path"],
+            }
 
         async def normalize_tools(state: AgentState, config: Optional[RunnableConfig] = None):
-            """Ensure tool messages carry structured JSON strings to stabilize LLM formatting."""
             normalized: List[Any] = []
             for msg in state["messages"]:
                 if isinstance(msg, ToolMessage):
@@ -311,7 +417,6 @@ class MCPAgent:
                         except Exception:
                             content = str(content)
                     else:
-                        # If not valid JSON, wrap in a JSON envelope
                         try:
                             json.loads(content)
                         except Exception:
@@ -325,60 +430,107 @@ class MCPAgent:
                     )
                 else:
                     normalized.append(msg)
-            return {"messages": normalized, "available_tools": state["available_tools"], "tool_sessions": state["tool_sessions"]}
+            return {
+                "messages": normalized,
+                "available_tools": state["available_tools"],
+                "tool_sessions": state["tool_sessions"],
+                "run_dir": state["run_dir"],
+                "todos": state["todos"],
+                "log_path": state["log_path"],
+            }
 
+        async def maybe_plan(state: AgentState, config: Optional[RunnableConfig] = None):
+            # If we already have todos, skip
+            if state.get("todos"):
+                return state
+            user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+            if not user:
+                return state
+            todos = self._write_todos(user.content)
+            logger.info("Planned todos: %s", todos)
+            plan_path = state["run_dir"] / "plan.json"
+            plan_path.write_text(json.dumps({"todos": todos}, indent=2))
+            self._log_run(state, f"PLAN todos={todos}")
+            # Append plan to messages for visibility
+            plan_msg = AIMessage(content=f"Planned TODOs: {todos}")
+            return {
+                "messages": state["messages"] + [plan_msg],
+                "available_tools": state["available_tools"],
+                "tool_sessions": state["tool_sessions"],
+                "run_dir": state["run_dir"],
+                "todos": todos,
+                "log_path": state["log_path"],
+            }
+
+        workflow.add_node("plan", maybe_plan)
         workflow.add_node("llm", call_llm)
         workflow.add_node("tool", maybe_tool)
         workflow.add_node("normalize_tools", normalize_tools)
 
-        def route_llm(state: AgentState):
+        def route(state: AgentState):
             last = state["messages"][-1]
             return "tool" if getattr(last, "tool_calls", None) else "end"
 
-        workflow.add_conditional_edges("llm", route_llm, {"tool": "tool", "end": END})
+        workflow.add_edge("plan", "llm")
+        workflow.add_conditional_edges("llm", route, {"tool": "tool", "end": END})
         workflow.add_edge("tool", "normalize_tools")
         workflow.add_edge("normalize_tools", "llm")
-        workflow.set_entry_point("llm")
+        workflow.set_entry_point("plan")
         return workflow
 
     async def run(self):
         await self.connect_servers()
         tools = self._build_tool_schemas()
-        # initial state with system prompt
         messages: List[Any] = [SystemMessage(content=SYSTEM_PROMPT)]
-        state = AgentState(messages=messages, available_tools=tools, tool_sessions=self.tool_sessions)
+        run_dir = RUNS_DIR / str(int(time.time()))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        log_path = run_dir / "run.log"
+        state = AgentState(
+            messages=messages,
+            available_tools=tools,
+            tool_sessions=self.tool_sessions,
+            run_dir=run_dir,
+            todos=[],
+            log_path=log_path,
+        )
         self._graph = self._build_graph().compile()
 
-        print("\nLangGraph MCP Agent started. Type 'quit' to exit.\n")
+        print("\nLangGraph Deep MCP Agent started. Type 'quit' to exit.\n")
         while True:
             user_text = input("You: ").strip()
             if user_text.lower() in {"quit", "exit"}:
                 break
             if user_text.lower() == "reset":
                 messages = [SystemMessage(content=SYSTEM_PROMPT)]
-                state = AgentState(messages=messages, available_tools=tools, tool_sessions=self.tool_sessions)
+                run_dir = RUNS_DIR / str(int(time.time()))
+                run_dir.mkdir(parents=True, exist_ok=True)
+                log_path = run_dir / "run.log"
+                state = AgentState(
+                    messages=messages,
+                    available_tools=tools,
+                    tool_sessions=self.tool_sessions,
+                    run_dir=run_dir,
+                    todos=[],
+                    log_path=log_path,
+                )
                 print("Memory reset.\n")
                 continue
 
             state["messages"].append(HumanMessage(content=user_text))
-            # Run the graph to completion and capture the resulting state
             state = await self._graph.ainvoke(state)
 
-            # Show the latest AI message if present
-            # Prefer the newest AIMessage after the last user turn
             ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage)]
             if ai_msgs:
                 last_ai = ai_msgs[-1]
-                content = last_ai.content
-                if content:
-                    print(f"\nAssistant: {content}\n")
+                if last_ai.content:
+                    print(f"\nAssistant: {last_ai.content}\n")
 
     async def close(self):
         await self.exit_stack.aclose()
 
 
 async def main():
-    agent = MCPAgent()
+    agent = DeepMCPAgent()
     try:
         await agent.run()
     finally:

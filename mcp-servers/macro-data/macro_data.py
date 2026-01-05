@@ -60,17 +60,20 @@ async def get_treasury_yields(limit: int = 5) -> str:
     except Exception:
         return "Could not parse Treasury yield XML."
 
-    entries = list(root.findall(".//entry"))
+    # Handle Atom namespace by wildcarding the prefix
+    entries = list(root.findall(".//{*}entry"))
     if not entries:
         return "No yield data returned."
 
+    def _get(entry, tag):
+        return entry.findtext(f".//{{*}}{tag}") or "N/A"
+
     lines = []
     for entry in entries[: max(1, min(limit, 30))]:
-        date_el = entry.find("NEW_DATE")
-        date_val = date_el.text if date_el is not None else "N/A"
-        y2 = (entry.findtext("BC_2YEAR") or "N/A")
-        y10 = (entry.findtext("BC_10YEAR") or "N/A")
-        y30 = (entry.findtext("BC_30YEAR") or "N/A")
+        date_val = _get(entry, "NEW_DATE")
+        y2 = _get(entry, "BC_2YEAR")
+        y10 = _get(entry, "BC_10YEAR")
+        y30 = _get(entry, "BC_30YEAR")
         lines.append(f"{date_val}: 2Y={y2} 10Y={y10} 30Y={y30}")
 
     return "Daily Treasury yield curve (most recent first):\n" + "\n".join(lines)

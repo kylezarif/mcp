@@ -4,6 +4,7 @@ This workspace includes two MCP clients and five finance-focused MCP servers tha
 
 - `mcp/mcp-client`: simple single-loop client.
 - `mcp/mcp-agentic`: LangGraph-based client with explicit graph/state handling and tool normalization.
+- `mcp/mcp-deep-agents`: LangGraph “deep agent” with planning (TODOs), scratch files, and MCP tool execution.
 
 ## Prerequisites
 - Python 3.11+
@@ -30,6 +31,15 @@ Agentic client:
 uv pip install -e mcp/mcp-agentic
 ```
 If you are already inside `mcp/mcp-agentic`, install with:
+```bash
+uv pip install -e .
+```
+
+Deep agent:
+```bash
+uv pip install -e mcp/mcp-deep-agents
+```
+If you are already inside `mcp/mcp-deep-agents`, install with:
 ```bash
 uv pip install -e .
 ```
@@ -130,10 +140,26 @@ Agentic client (mcp-agentic / LangGraph)
 │      OpenAI LLM        │ <------------------------------------------> │  LangGraph MCP Agent     │
 │  (chat + tool calling) │   tools advertised via server__tool schemas  │  (llm → tool → normalize │
 └────────────────────────┘                                              │   → llm)                 │
-                                                                       └──────────────┬───────────┘
-                                                                                      │
+                                                                      └──────────────┬───────────┘
+                                                                                     │
                                            ~/.mcp/config.json declares servers        │ stdio
-                                                                                      │
+                                                                                     │
+     ┌────────────────┬─────────────┬──────────────┬───────────────┬──────────────┐
+     │ sec-filings    │ gdelt-news  │ macro-data   │ stooq-prices  │ fhfa-hpi     │
+     │ (SEC EDGAR)    │ (GDELT DOC) │ (Treasury,   │ (Stooq CSV)   │ (FHFA HPI)   │
+     │                │             │  WB, ECB)    │               │              │
+     └────────────────┴─────────────┴──────────────┴───────────────┴──────────────┘
+
+Deep agent (mcp-deep-agents / LangGraph with planning)
+┌────────────────────────┐   messages (system prompt + memory window)   ┌─────────────────────────────┐
+│      OpenAI LLM        │ <------------------------------------------> │  Deep MCP Agent (plan →      │
+│  (chat + tool calling) │   tools advertised via server__tool schemas  │  tool → normalize → llm)     │
+└────────────────────────┘                                              └────────────────┬────────────┘
+                                                                                         │
+                                            ~/.mcp/config.json declares servers           │ stdio
+                                                                                         │
+                plans + tool outputs saved to runs/<timestamp>/ (persistent scratchpad)
+                                                                                         │
      ┌────────────────┬─────────────┬──────────────┬───────────────┬──────────────┐
      │ sec-filings    │ gdelt-news  │ macro-data   │ stooq-prices  │ fhfa-hpi     │
      │ (SEC EDGAR)    │ (GDELT DOC) │ (Treasury,   │ (Stooq CSV)   │ (FHFA HPI)   │
@@ -141,6 +167,9 @@ Agentic client (mcp-agentic / LangGraph)
      └────────────────┴─────────────┴──────────────┴───────────────┴──────────────┘
 
 Memory/prompt: both clients keep a rolling history (configurable via `MCP_MAX_HISTORY`) that includes the system prompt. `reset` clears in-memory history; restart clears all state. Tools are normalized as `server__tool` for OpenAI compatibility. The agentic client also normalizes tool outputs into JSON strings to stabilize formatting between turns.
+
+## Article and walkthrough
+See `mcp/article.md` for a narrative overview of the architectures (classic, agentic, deep), how to run them, and what to expect.
 ```
 
 ## Add a new server (step by step)
@@ -183,6 +212,18 @@ uv run python client.py
 ```
 It uses the same servers from `~/.mcp/config.json`, applies the same prompt/memory window, and drives tool calls through a LangGraph loop (LLM → tools → LLM).
 
+## Run the deep agent (plan + scratchpad)
+From repo root:
+```bash
+uv run --directory mcp/mcp-deep-agents python client.py
+```
+From inside `mcp/mcp-deep-agents`:
+```bash
+uv run python client.py
+```
+Adds planning (TODOs), tool execution, and persists plans/outputs to `runs/<timestamp>/`.
+
 ## Benefits at a glance
 - **mcp-client (classic):** minimal dependencies, straightforward control flow, good for quick CLI use and debugging tool availability.
 - **mcp-agentic (LangGraph):** explicit graph (LLM → tool → normalization → LLM), safer tool name handling, heuristics to infer missing args (tickers, dates, CIKs), and tool output normalization to stabilize responses.
+- **mcp-deep-agents (LangGraph + planning):** adds TODO planning, scratch files (`runs/`), and heuristics for missing args; designed for multi-step tasks and revisitable context.
