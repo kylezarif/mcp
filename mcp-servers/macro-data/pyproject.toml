@@ -1,0 +1,13 @@
+[project]
+name = "macro-data"
+version = "0.1.0"
+description = "MCP server for macro data: Treasury Fiscal Data, World Bank, and ECB (keyless)."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.21.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
